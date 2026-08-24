@@ -182,8 +182,13 @@ class WhatsAppBehaviorMixin:
         if not value:
             return ""
         normalized = str(value).strip()
-        if ":" in normalized and "@" in normalized:
-            normalized = normalized.replace(":", "@", 1)
+        # Strip a device suffix like ":12" between the base id and the
+        # domain (e.g. "447397235771:12@s.whatsapp.net" ->
+        # "447397235771@s.whatsapp.net"). A naive first-colon replace turns
+        # this into "447397235771@12@s.whatsapp.net", which never matches
+        # the bot's own undeviced id and silently breaks reply/mention
+        # detection for swipe-replies.
+        normalized = re.sub(r":[^@]*@", "@", normalized)
         return normalized
 
     @staticmethod

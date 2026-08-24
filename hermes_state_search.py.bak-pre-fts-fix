@@ -25,7 +25,6 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
-    _fts_index_content_sql,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -103,10 +102,9 @@ class SessionSearchMixin:
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
-                self._backfill_fts_content(conn, lo=lo, hi=hi)
                 conn.execute(
                     "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
-                    f"SELECT m.id, {_fts_index_content_sql('m.content', 'm.fts_content')}, m.tool_name, m.tool_calls "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
                     "FROM messages m "
                     "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
@@ -201,11 +199,10 @@ class SessionSearchMixin:
                 (progress, upper),
             )
             if include_trigram:
-                self._backfill_fts_content(conn, lo=progress, hi=upper)
                 conn.execute(
                     "INSERT INTO messages_fts_trigram"
                     "(rowid, content, tool_name, tool_calls) "
-                    f"SELECT id, {_fts_index_content_sql('content', 'fts_content')}, tool_name, tool_calls FROM messages "
+                    "SELECT id, content, tool_name, tool_calls FROM messages "
                     "WHERE id > ? AND id <= ? AND role <> 'tool'",
                     (progress, upper),
                 )
@@ -269,10 +266,9 @@ class SessionSearchMixin:
             if progress >= high_water:
                 return False
             upper = min(progress + chunk, high_water)
-            self._backfill_fts_content(conn, lo=progress, hi=upper)
             conn.execute(
                 "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) "
-                f"SELECT id, {_fts_index_content_sql('content', 'fts_content')}, tool_name, tool_calls FROM messages "
+                "SELECT id, content, tool_name, tool_calls FROM messages "
                 "WHERE id > ? AND id <= ? AND role <> 'tool'",
                 (progress, upper),
             )
@@ -305,10 +301,9 @@ class SessionSearchMixin:
             if hw_row is not None:
                 hw = int(hw_row[0])
                 lo, hi = hw - 1000, hw + 1000
-                self._backfill_fts_content(conn, lo=lo, hi=hi)
                 conn.execute(
                     "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) "
-                    f"SELECT m.id, {_fts_index_content_sql('m.content', 'm.fts_content')}, m.tool_name, m.tool_calls "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
                     "FROM messages m "
                     "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_cjk_docsize d WHERE d.id = m.id)",

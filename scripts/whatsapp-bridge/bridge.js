@@ -38,6 +38,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createQuotedMediaCache,
   extractBridgeEvent,
   inboundReadReceiptKeys,
   inferMediaType,
@@ -203,7 +204,12 @@ function trackSentMessageId(sent) {
 
 function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  // Strip a device suffix like ":12" between id and domain, e.g.
+  // "447397235771:12@s.whatsapp.net" -> "447397235771@s.whatsapp.net".
+  // A naive first-colon replace instead produces "...@12@s.whatsapp.net",
+  // which never matches the bot's own id and silently breaks reply/mention
+  // detection for swipe-replies.
+  return String(value).replace(/:[^@]*@/, '@');
 }
 
 function redactWhatsAppId(value) {
@@ -279,6 +285,10 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+// Bounded cache of already-downloaded inbound media, so a later reply to an
+// uncaptioned photo/video/document/voice note can still surface the original
+// file — see createQuotedMediaCache's doc comment in bridge_helpers.js.
+const quotedMediaCache = createQuotedMediaCache(512);
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -343,6 +353,17 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
   const dedupeId = `poll:${pollId}:${senderId}:${selectedOptions.join('|')}`;
   if (recentlyProcessedPollUpdates.has(dedupeId)) return;
   recentlyProcessedPollUpdates.remember(dedupeId);
+  // Every poll reaching this point was sent by us (recentlySentIds check
+  // above), so the vote is inherently a reply to our own message. Populate
+  // botIds/quotedParticipant so the gateway's reply-to-bot/mention gate
+  // recognizes it — otherwise a poll vote in a mention-gated group
+  // (require_mention: true) satisfies none of "/command", "@mention", or
+  // "reply to bot" and is silently dropped before the agent ever sees it,
+  // leaving any clarify() question that used the poll stuck forever.
+  const botIds = Array.from(new Set([
+    normalizeWhatsAppId(sock?.user?.id),
+    normalizeWhatsAppId(sock?.user?.lid),
+  ].filter(Boolean)));
   const event = {
     messageId: `${pollId || 'poll'}:update:${Date.now()}`,
     chatId,
@@ -366,11 +387,11 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     mediaUrls: [],
     mentionedIds: [],
     quotedMessageId: pollId,
-    quotedParticipant: '',
+    quotedParticipant: botIds[0] || '',
     quotedRemoteJid: chatId,
     quotedText: '',
     hasQuotedMessage: !!pollId,
-    botIds: [],
+    botIds,
     timestamp: Math.floor(Date.now() / 1000),
   };
   messageQueue.push(event);
@@ -727,6 +748,7 @@ async function startSocket() {
           document: DOCUMENT_CACHE_DIR,
           audio: AUDIO_CACHE_DIR,
         },
+        lookupQuotedMedia: (quotedChatId, quotedMessageId) => quotedMediaCache.get(quotedChatId, quotedMessageId),
       });
       event.fromOwner = fromOwner;
 
@@ -755,6 +777,15 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
+      // Remember this message's already-downloaded media/text so a later
+      // reply to it (even uncaptioned media) can resolve the original
+      // content instead of seeing only a stripped-down quoted-message stub.
+      quotedMediaCache.remember(chatId, msg.key.id, {
+        body: event.body,
+        hasMedia: event.hasMedia,
+        mediaType: event.mediaType,
+        mediaUrls: event.mediaUrls,
+      });
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',
