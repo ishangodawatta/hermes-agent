@@ -226,8 +226,8 @@ TOOLSETS = {
     # in _HERMES_CORE_TOOLS (would enable it for every platform by default);
     # enable per-platform via platform_toolsets in config.yaml instead.
     "relay": {
-        "description": "Cross-chat relay: queue a fact for background delivery to another registered person (local-only feature)",
-        "tools": ["relay_note"],
+        "description": "Cross-chat relay: queue a fact for background delivery, or log an activity for automatic same-day cross-person matching (local-only feature)",
+        "tools": ["relay_note", "log_activity"],
         "includes": []
     },
 

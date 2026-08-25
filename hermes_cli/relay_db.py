@@ -72,6 +72,29 @@ CREATE TABLE IF NOT EXISTS relay_fact_targets (
 CREATE INDEX IF NOT EXISTS idx_relay_fact_targets_pending
     ON relay_fact_targets(delivered_at)
     WHERE delivered_at IS NULL;
+
+-- Logged activities feed the background scanner's cross-person matching
+-- (gateway/relay_watchers.py's _relay_scanner_watcher). Distinct from
+-- relay_facts: an activity is logged with no known target yet ("heading to
+-- Tesco" — nobody obviously needs telling right now); relay_facts/targets
+-- are only created once the scanner finds an actual match against another
+-- person's activity. Deliberately NOT the calendar — see the spec's
+-- "same-person calendar-conflict reminders" section for why calendar
+-- integration is a separate, prompt-level concern, not this table.
+CREATE TABLE IF NOT EXISTS relay_activities (
+    activity_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id        TEXT NOT NULL REFERENCES known_people(person_id),
+    platform         TEXT NOT NULL,
+    chat_id          TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    occurred_at      INTEGER NOT NULL,
+    compared_at      INTEGER,
+    matched_fact_id  INTEGER REFERENCES relay_facts(fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relay_activities_uncompared
+    ON relay_activities(compared_at)
+    WHERE compared_at IS NULL;
 """
 
 
@@ -225,4 +248,88 @@ def mark_delivered(conn: sqlite3.Connection, fact_id: int, target_person_id: str
         """UPDATE relay_fact_targets SET delivered_at = ?
            WHERE fact_id = ? AND target_person_id = ?""",
         (int(time.time()), fact_id, target_person_id),
+    )
+
+
+def log_activity(
+    conn: sqlite3.Connection,
+    *,
+    person_id: str,
+    platform: str,
+    chat_id: str,
+    description: str,
+    occurred_at: Optional[int] = None,
+) -> int:
+    """Log an activity with no known target yet — the scanner watcher
+    (gateway/relay_watchers.py) matches it against other people's activities
+    later. Distinct from record_relay_fact, which is for the rare case the
+    agent already knows who to tell."""
+    cursor = conn.execute(
+        """INSERT INTO relay_activities
+           (person_id, platform, chat_id, description, occurred_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (person_id, platform, chat_id, description, occurred_at or int(time.time())),
+    )
+    return cursor.lastrowid
+
+
+class LoggedActivity(NamedTuple):
+    activity_id: int
+    person_id: str
+    description: str
+    occurred_at: int
+    platform: str
+    chat_id: str
+
+
+def uncompared_activities(conn: sqlite3.Connection, limit: int = 20) -> list[LoggedActivity]:
+    """Activities the scanner hasn't evaluated yet, oldest first."""
+    rows = conn.execute(
+        """SELECT activity_id, person_id, description, occurred_at, platform, chat_id
+           FROM relay_activities
+           WHERE compared_at IS NULL
+           ORDER BY occurred_at ASC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [LoggedActivity(*row) for row in rows]
+
+
+def candidate_activities(
+    conn: sqlite3.Connection,
+    *,
+    exclude_person_id: str,
+    since: int,
+) -> list[LoggedActivity]:
+    """Other people's activities since ``since`` (a unix timestamp) — the
+    pool a pivot activity gets compared against. Includes already-compared
+    activities: a no-match activity can still become matched later when a
+    new related one arrives, so being "compared" doesn't exclude it from
+    being a candidate for someone else's comparison."""
+    rows = conn.execute(
+        """SELECT activity_id, person_id, description, occurred_at, platform, chat_id
+           FROM relay_activities
+           WHERE person_id != ? AND occurred_at >= ?
+           ORDER BY occurred_at ASC""",
+        (exclude_person_id, since),
+    ).fetchall()
+    return [LoggedActivity(*row) for row in rows]
+
+
+def mark_activity_compared(
+    conn: sqlite3.Connection, activity_id: int, *, matched_fact_id: Optional[int] = None
+) -> None:
+    conn.execute(
+        """UPDATE relay_activities SET compared_at = ?, matched_fact_id = ?
+           WHERE activity_id = ?""",
+        (int(time.time()), matched_fact_id, activity_id),
+    )
+
+
+def mark_activity_matched(conn: sqlite3.Connection, activity_id: int, fact_id: int) -> None:
+    """Retroactively mark an already-compared candidate activity as matched,
+    once a later pivot activity's comparison connects it to a new fact."""
+    conn.execute(
+        "UPDATE relay_activities SET matched_fact_id = ? WHERE activity_id = ?",
+        (fact_id, activity_id),
     )

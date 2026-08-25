@@ -13367,9 +13367,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
-        # Start background cross-chat relay notifier (local-only feature,
-        # see gateway/relay_watchers.py — not upstream).
+        # Start background cross-chat relay notifier + scanner (local-only
+        # feature, see gateway/relay_watchers.py — not upstream).
         self._spawn_supervised(self._relay_notifier_watcher, "relay_notifier_watcher")
+        self._spawn_supervised(self._relay_scanner_watcher, "relay_scanner_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
