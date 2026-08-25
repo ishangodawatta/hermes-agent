@@ -486,6 +486,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bridge message_id}.
+        # Mirrors Telegram's adapter (#30045): tracks status bubbles owned by
+        # this adapter so subsequent calls with the same key edit the same
+        # message instead of appending new ones.
+        self._status_message_ids: Dict[tuple, str] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -991,6 +996,43 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a status message, or edit the previous one with the same key.
+
+        Mirrors the Telegram adapter's method of the same name (#30045):
+        progress/status callbacks used to append a fresh bubble on every
+        call. The first call for a (chat_id, status_key) pair sends fresh
+        and remembers the message id; subsequent calls edit that same
+        message in place. If the edit fails (message deleted, bridge error,
+        etc.) the cached id is dropped and this falls back to a fresh send.
+
+        Unlike Telegram's ``edit_message``, WhatsApp's does not accept
+        ``metadata`` and always returns the same message_id it was given on
+        success (confirmed by reading the bridge's ``/edit`` handler — an
+        edit targets the existing message key rather than creating a new
+        one), so there is no id to refresh from the edit result the way
+        Telegram's version does.
+        """
+        key = (str(chat_id), str(status_key))
+        cached_id = self._status_message_ids.get(key)
+        if cached_id is not None:
+            result = await self.edit_message(chat_id, cached_id, content)
+            if result.success:
+                return result
+            # Edit failed — clear the cached id and fall through to a fresh send.
+            self._status_message_ids.pop(key, None)
+        result = await self.send(chat_id, content, metadata=metadata)
+        if result.success and result.message_id:
+            self._status_message_ids[key] = str(result.message_id)
+        return result
 
     async def edit_message(
         self,
@@ -1584,6 +1626,34 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if quoted_participant:
                     reply_to_author_id = quoted_participant
                 reply_to_is_own_message = self._message_is_reply_to_bot(data)
+
+                # contextInfo.quotedMessage only ever carries a thumbnail-sized
+                # stub for media (or nothing for an uncaptioned attachment) —
+                # never a way to fetch the original file. The bridge resolves
+                # the quoted message's already-downloaded media via its own
+                # cache and hands back real local paths in quotedMediaUrls.
+                # Append them to this event's own media so the existing
+                # vision/audio pipeline (which reads media_urls/media_types)
+                # picks up the quoted attachment exactly like a direct one —
+                # no separate reply-media code path needed.
+                quoted_media_urls = data.get("quotedMediaUrls") or []
+                quoted_media_type = str(data.get("quotedMediaType") or "").strip()
+                _quoted_mime_map = {
+                    "image": "image/jpeg",
+                    "video": "video/mp4",
+                    "gif": "video/mp4",
+                    "audio": "audio/ogg",
+                    "ptt": "audio/ogg",
+                    "document": "application/octet-stream",
+                    "sticker": "image/webp",
+                }
+                for _qurl in quoted_media_urls:
+                    if not (isinstance(_qurl, str) and os.path.isabs(_qurl) and _is_allowed_bridge_path(_qurl)):
+                        print(f"[{self.name}] Rejected quoted-media path outside cache dir: {_qurl}", flush=True)
+                        continue
+                    cached_urls.append(_qurl)
+                    media_types.append(_quoted_mime_map.get(quoted_media_type, "application/octet-stream"))
+                    print(f"[{self.name}] Attached quoted-reply media: {_qurl}", flush=True)
             MAX_TEXT_INJECT_BYTES = 100 * 1024
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 for doc_path in cached_urls:

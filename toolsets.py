@@ -245,6 +245,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    # LOCAL-ONLY, not upstream — see hermes_cli/relay_db.py. Deliberately not
+    # in _HERMES_CORE_TOOLS (would enable it for every platform by default);
+    # enable per-platform via platform_toolsets in config.yaml instead.
+    "relay": {
+        "description": "Cross-chat relay: queue a fact for background delivery to another registered person (local-only feature)",
+        "tools": ["relay_note"],
+        "includes": []
+    },
+
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],
