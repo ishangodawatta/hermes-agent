@@ -2666,6 +2666,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.relay_watchers import GatewayRelayWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -6732,7 +6733,7 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayRelayWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -13365,6 +13366,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # subscriptions owned by the profiles whose adapters it hosts, even
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+
+        # Start background cross-chat relay notifier (local-only feature,
+        # see gateway/relay_watchers.py — not upstream).
+        self._spawn_supervised(self._relay_notifier_watcher, "relay_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
