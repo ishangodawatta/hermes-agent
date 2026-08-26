@@ -32,6 +32,8 @@ Architecture (see the spec for the full rationale):
 
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -161,12 +163,114 @@ def resolve_person_by_name(conn: sqlite3.Connection, name: str) -> Optional[str]
     here means relaying a private fact to the wrong person, which is a much
     worse failure than the agent simply not finding a match (see the spec's
     "unresolved-name handling" open question).
+
+    Falls back to family-facts (see sync_person_by_name_from_family_facts)
+    when not already known locally — see the person-registry-consolidation
+    spec: family-facts is the canonical registry, relay.db should not need a
+    second manual registration for someone it already knows.
     """
     row = conn.execute(
         "SELECT person_id FROM known_people WHERE lower(display_name) = lower(?)",
         (name,),
     ).fetchone()
-    return row[0] if row else None
+    if row:
+        return row[0]
+    return sync_person_by_name_from_family_facts(conn, name)
+
+
+def _family_facts_db_path() -> Optional[Path]:
+    """Resolve family-facts' family.db, mirroring its own db_path() logic.
+
+    family-facts is a skill script (~/.hermes/skills/family/family-facts),
+    not part of the hermes-agent package, so it can't be imported directly —
+    this reads its known schema (people/identifiers tables) via a read-only
+    connection instead.
+    """
+    explicit = os.environ.get("FAMILY_FACTS_DB")
+    path = Path(explicit).expanduser() if explicit else get_hermes_home() / "family" / "family.db"
+    return path if path.is_file() else None
+
+
+def _family_facts_display_name_for_chat_id(chat_id: str) -> Optional[str]:
+    """Resolve a chat_id's digits against family-facts' identifiers table."""
+    digits = re.sub(r"\D", "", chat_id)
+    if not digits:
+        return None
+    db_path = _family_facts_db_path()
+    if not db_path:
+        return None
+    ff_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = ff_conn.execute(
+            "SELECT p.display_name FROM identifiers i "
+            "JOIN people p ON p.person_id = i.person_id WHERE i.identifier = ?",
+            (digits,),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        ff_conn.close()
+
+
+def sync_person_from_family_facts(
+    conn: sqlite3.Connection, platform: str, chat_id: str
+) -> Optional[str]:
+    """Auto-register a person in relay.db from family-facts' canonical
+    registry, keyed off a chat_id already seen live — avoids a second,
+    manual registration step for anyone family-facts already knows (see the
+    person-registry-consolidation spec: this was previously a fully manual,
+    easy-to-forget step — Senara had to be found and registered by hand
+    2026-08-26 despite family-facts already knowing her).
+
+    relay.db's own person_id stays a lowercased-display-name slug (not
+    family-facts' own person_id, which uses kinship-term slugs like "ammi")
+    to avoid migrating existing relay_activities/relay_facts rows, which
+    already use this convention.
+
+    Returns the resolved person_id, or None if family-facts doesn't know
+    this chat_id either (a genuinely new contact — needs a manual
+    `person add` in family-facts first, not something relay.db can invent).
+    """
+    display_name = _family_facts_display_name_for_chat_id(chat_id)
+    if not display_name:
+        return None
+    person_id = display_name.strip().lower()
+    register_person(conn, person_id, display_name)
+    link_channel(conn, platform, chat_id, person_id)
+    return person_id
+
+
+def sync_person_by_name_from_family_facts(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    """Fallback for resolve_person_by_name: check family-facts by display
+    name and auto-register into relay.db (including a best-effort WhatsApp
+    identifier) if found there but not yet locally known.
+
+    Identifier reconstruction is best-effort: every WhatsApp identifier this
+    family currently has on file is @lid-suffixed (confirmed 2026-08-26,
+    see the person-registry-consolidation spec) — fine for a single-family
+    install, not a general rule for other WhatsApp id formats.
+    """
+    db_path = _family_facts_db_path()
+    if not db_path:
+        return None
+    ff_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = ff_conn.execute(
+            "SELECT p.display_name, "
+            "(SELECT identifier FROM identifiers WHERE person_id = p.person_id "
+            " AND kind = 'whatsapp' ORDER BY length(identifier) DESC LIMIT 1) "
+            "FROM people p WHERE lower(p.display_name) = lower(?)",
+            (name,),
+        ).fetchone()
+    finally:
+        ff_conn.close()
+    if not row:
+        return None
+    display_name, best_identifier = row
+    person_id = display_name.strip().lower()
+    register_person(conn, person_id, display_name)
+    if best_identifier:
+        link_channel(conn, "whatsapp", f"{best_identifier}@lid", person_id)
+    return person_id
 
 
 def resolve_channel(conn: sqlite3.Connection, person_id: str, platform: str) -> Optional[str]:

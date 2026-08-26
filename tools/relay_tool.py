@@ -99,13 +99,18 @@ def relay_note(
 
     conn = relay_db.connect()
     try:
-        source_person_id = None
         row = conn.execute(
             "SELECT person_id FROM person_channels WHERE platform = ? AND chat_id = ?",
             (source_platform, source_chat_id),
         ).fetchone()
         if row:
             source_person_id = row[0]
+        else:
+            # Falls back to family-facts (canonical registry) before giving
+            # up -- see the person-registry-consolidation spec.
+            source_person_id = relay_db.sync_person_from_family_facts(
+                conn, source_platform, source_chat_id
+            )
 
         resolved: list[str] = []
         unresolved: list[str] = []

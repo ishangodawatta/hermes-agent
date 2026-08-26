@@ -238,9 +238,15 @@ def run_notice_classifier_tick(*, platform: str, chat_id: str, message_text: str
             "SELECT person_id FROM person_channels WHERE platform = ? AND chat_id = ?",
             (platform, chat_id),
         ).fetchone()
-        if not row:
-            return  # chat isn't linked to a registered person; nothing to classify against
-        person_id = row[0]
+        if row:
+            person_id = row[0]
+        else:
+            # Not yet known locally -- check family-facts (the canonical
+            # registry) before giving up, rather than requiring a second,
+            # manual registration for someone it already knows.
+            person_id = relay_db.sync_person_from_family_facts(conn, platform, chat_id)
+        if not person_id:
+            return  # chat isn't linked to a registered person anywhere; nothing to classify against
         person_row = conn.execute(
             "SELECT display_name FROM known_people WHERE person_id = ?", (person_id,)
         ).fetchone()
