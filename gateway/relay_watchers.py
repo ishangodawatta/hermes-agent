@@ -178,7 +178,7 @@ def _format_when(occurred_at: int, now: int) -> str:
 class GatewayRelayWatchersMixin:
     """Background relay-delivery loop methods for GatewayRunner."""
 
-    async def _relay_scanner_watcher(self, interval: float = 15.0) -> None:
+    async def _relay_scanner_watcher(self, interval: float = 4.0) -> None:
         """Poll ``relay_activities`` for uncompared entries and cross-match
         each against other people's same-day activities.
 
@@ -187,6 +187,14 @@ class GatewayRelayWatchersMixin:
         would either block that turn on an LLM call or need real async task
         scheduling wired into the conversation loop — a short poll achieves
         functionally the same "near-immediate" feel with far less risk.
+
+        Lowered from 15.0 to 4.0 (2026-08-26): a real live test measured
+        ~34s from activity-logged to compared_at, of which up to 15s was
+        pure "waiting for the next tick" rather than the judgment LLM call
+        itself. An empty tick is a cheap SELECT that returns immediately
+        (see _relay_scan_tick's early exit when there are no pivots), so a
+        tighter interval costs nothing when idle and only shortens the
+        worst-case wait when there's real work to pick up.
         """
         await asyncio.sleep(5)
         while self._running:
@@ -398,7 +406,7 @@ class GatewayRelayWatchersMixin:
         except (json.JSONDecodeError, ValueError):
             return None
 
-    async def _relay_notifier_watcher(self, interval: float = 10.0) -> None:
+    async def _relay_notifier_watcher(self, interval: float = 3.0) -> None:
         """Poll ``relay_fact_targets`` and deliver pending relays.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
@@ -406,6 +414,11 @@ class GatewayRelayWatchersMixin:
         lock, same rationale as the kanban notifier. Failures in one tick
         don't stop subsequent ticks — a delivery that fails this tick is
         simply retried next tick, since it stays ``delivered_at IS NULL``.
+
+        Lowered from 10.0 to 3.0 (2026-08-26), same rationale as the
+        scanner's interval reduction — an empty tick is a cheap SELECT with
+        an early exit, so a tighter interval only shortens real delivery
+        latency, not idle cost.
         """
         await asyncio.sleep(5)  # let adapters finish wiring up before the first tick
         while self._running:
