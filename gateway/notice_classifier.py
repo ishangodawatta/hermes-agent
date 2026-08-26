@@ -32,6 +32,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from typing import Any, Dict, Optional
@@ -221,13 +222,31 @@ def _todoist_add(content: str, *, labels: list[str]) -> None:
         logger.exception("notice classifier: todoist add raised")
 
 
+_REACTION_MARKER_RE = re.compile(r"^\[Reaction:\s")
+
+
 def run_notice_classifier_tick(*, platform: str, chat_id: str, message_text: str) -> None:
     """Classify one inbound message and route any signals. Synchronous —
     callers dispatch this via asyncio.to_thread so it never blocks the
     conversational turn. Fails silently (logged, not raised): a missed
     classification is no worse than today's status quo, and this must never
-    be able to disrupt or delay the user-facing reply."""
+    be able to disrupt or delay the user-facing reply.
+
+    A WhatsApp reaction (``[Reaction: <emoji> to <msgid>]``, see
+    bridge_helpers.js's formatReactionText()) is skipped before the LLM is
+    even invoked — confirmed live 2026-08-26 that a plain thumbs-up got
+    hallucinated into a fabricated errand ("Ishan going to Tesco") since
+    a fresh, context-free classifier has nothing to ground a reaction in.
+    A reaction can never itself be an errand/request/commitment, so there's
+    nothing for the classifier to legitimately find here. Treating a 👍/✅
+    as a genuine acknowledgement (e.g. closing a related Todoist task) is
+    real follow-on work blocked on resolving the reacted-to message's own
+    content, which isn't reliably available today — see the
+    alfred-manager-architecture spec's "Reaction handling" section.
+    """
     if not message_text or not message_text.strip():
+        return
+    if _REACTION_MARKER_RE.match(message_text.strip()):
         return
 
     from hermes_cli import relay_db

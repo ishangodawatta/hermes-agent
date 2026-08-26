@@ -73,6 +73,18 @@ class TestRunNoticeClassifierTick:
         )
         assert called == []
 
+    def test_reaction_marker_short_circuits(self, relay_conn, known_person, monkeypatch):
+        # Regression test: a plain reaction was hallucinated into a
+        # fabricated errand ("Ishan going to Tesco") before this guard --
+        # see the alfred-manager-architecture spec's "Reaction handling".
+        called = []
+        monkeypatch.setattr(notice_classifier, "_run_notice_classifier_llm", lambda p: called.append(p) or {"final": "", "error": None})
+        notice_classifier.run_notice_classifier_tick(
+            platform="whatsapp", chat_id=_KNOWN_CHAT_ID,
+            message_text="[Reaction: \U0001F44D to 3EB04F396F3F9B43BCD123]",
+        )
+        assert called == []
+
     def test_unlinked_chat_short_circuits(self, relay_conn, known_person, monkeypatch):
         called = []
         monkeypatch.setattr(notice_classifier, "_run_notice_classifier_llm", lambda p: called.append(p) or {"final": "", "error": None})
