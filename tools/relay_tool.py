@@ -97,25 +97,15 @@ def relay_note(
     if not source_platform or not source_chat_id:
         return "Error: current session has no platform/chat_id — cannot relay from here."
 
+    source_resolved = relay_db.resolve_person_from_chat_id(source_chat_id)
+    source_person_id = source_resolved[0] if source_resolved else None
+
     conn = relay_db.connect()
     try:
-        row = conn.execute(
-            "SELECT person_id FROM person_channels WHERE platform = ? AND chat_id = ?",
-            (source_platform, source_chat_id),
-        ).fetchone()
-        if row:
-            source_person_id = row[0]
-        else:
-            # Falls back to family-facts (canonical registry) before giving
-            # up -- see the person-registry-consolidation spec.
-            source_person_id = relay_db.sync_person_from_family_facts(
-                conn, source_platform, source_chat_id
-            )
-
         resolved: list[str] = []
         unresolved: list[str] = []
         for name in interested:
-            person_id = relay_db.resolve_person_by_name(conn, name)
+            person_id = relay_db.resolve_person_by_name(name)
             if person_id:
                 resolved.append(person_id)
             else:

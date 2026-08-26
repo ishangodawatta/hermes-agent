@@ -256,13 +256,9 @@ class GatewayRelayWatchersMixin:
                 continue
 
             def _load_context(pivot=pivot):
+                pivot_name = relay_db.display_name_for_person(pivot.person_id)
                 conn = relay_db.connect()
                 try:
-                    person_row = conn.execute(
-                        "SELECT display_name FROM known_people WHERE person_id = ?",
-                        (pivot.person_id,),
-                    ).fetchone()
-                    pivot_name = person_row[0] if person_row else pivot.person_id
                     candidates = relay_db.candidate_activities(
                         conn, exclude_person_id=pivot.person_id, since=day_start
                     )
@@ -377,14 +373,7 @@ class GatewayRelayWatchersMixin:
     def _relay_person_display_name(self, person_id: str) -> str:
         from hermes_cli import relay_db
 
-        conn = relay_db.connect()
-        try:
-            row = conn.execute(
-                "SELECT display_name FROM known_people WHERE person_id = ?", (person_id,)
-            ).fetchone()
-            return row[0] if row else person_id
-        finally:
-            conn.close()
+        return relay_db.display_name_for_person(person_id)
 
     def _relay_mark_compared_sync(self, activity_id: int, matched_fact_id: Optional[int]) -> None:
         from hermes_cli import relay_db
@@ -435,17 +424,19 @@ class GatewayRelayWatchersMixin:
             conn = relay_db.connect()
             try:
                 pending = relay_db.pending_relay_targets(conn)
-                out = []
-                for item in pending:
-                    row = conn.execute(
-                        "SELECT platform, chat_id FROM person_channels WHERE person_id = ?",
-                        (item.target_person_id,),
-                    ).fetchone()
-                    platform, chat_id = row if row else (None, None)
-                    out.append((item, platform, chat_id))
-                return out
             finally:
                 conn.close()
+            out = []
+            for item in pending:
+                # Only WhatsApp is wired for delivery today (see
+                # resolve_chat_id_for_person's docstring) -- this widens
+                # naturally once family-facts carries other platform kinds.
+                chat_id = relay_db.resolve_chat_id_for_person(
+                    item.target_person_id, platform="whatsapp"
+                )
+                platform = "whatsapp" if chat_id else None
+                out.append((item, platform, chat_id))
+            return out
 
         deliveries = await asyncio.to_thread(_collect)
         if not deliveries:

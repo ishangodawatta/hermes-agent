@@ -232,27 +232,10 @@ def run_notice_classifier_tick(*, platform: str, chat_id: str, message_text: str
 
     from hermes_cli import relay_db
 
-    conn = relay_db.connect()
-    try:
-        row = conn.execute(
-            "SELECT person_id FROM person_channels WHERE platform = ? AND chat_id = ?",
-            (platform, chat_id),
-        ).fetchone()
-        if row:
-            person_id = row[0]
-        else:
-            # Not yet known locally -- check family-facts (the canonical
-            # registry) before giving up, rather than requiring a second,
-            # manual registration for someone it already knows.
-            person_id = relay_db.sync_person_from_family_facts(conn, platform, chat_id)
-        if not person_id:
-            return  # chat isn't linked to a registered person anywhere; nothing to classify against
-        person_row = conn.execute(
-            "SELECT display_name FROM known_people WHERE person_id = ?", (person_id,)
-        ).fetchone()
-        person_name = person_row[0] if person_row else person_id
-    finally:
-        conn.close()
+    resolved = relay_db.resolve_person_from_chat_id(chat_id)
+    if not resolved:
+        return  # chat isn't linked to a family-facts person; nothing to classify against
+    person_id, person_name = resolved
 
     prompt = _NOTICE_PROMPT_TEMPLATE.format(person_name=person_name, message_text=message_text)
     review = _run_notice_classifier_llm(prompt)

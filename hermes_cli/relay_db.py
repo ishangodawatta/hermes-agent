@@ -1,4 +1,4 @@
-"""Cross-chat relay: person registry and structured fact store.
+"""Cross-chat relay: structured fact store, backed by family-facts for identity.
 
 LOCAL-ONLY — NOT FOR UPSTREAM. This feature is not intended as a PR to
 NousResearch/hermes-agent; it stays in this fork/install only. Its
@@ -16,13 +16,25 @@ Deliberately isolated from the main ``state.db`` in its own ``relay.db``,
 mirroring how ``kanban_db.py`` keeps kanban state separate — smaller blast
 radius, no interaction with the heavily-churned core session/message schema.
 
-Architecture (see the spec for the full rationale):
-- ``known_people`` / ``person_channels``: a general person registry, mapping
-  each person to their chat identity on one or more platforms.
+Architecture (see the ``hermes-agent-person-registry-consolidation`` spec for
+the full rationale and decision log):
+- **No local person registry.** This module used to keep its own
+  ``known_people``/``person_channels`` tables, duplicating identity data
+  that ``family-facts`` (``~/.hermes/skills/family/family-facts``) already
+  owns canonically. That duplication meant registering a new family member
+  required two separate manual steps and could silently drift out of sync
+  (confirmed 2026-08-26: Senara had to be found and registered by hand in
+  relay.db despite family-facts already knowing her). Removed 2026-08-26 —
+  every person lookup now goes live, read-only, to family-facts' own
+  ``family.db`` on every call. relay.db stores family-facts' own
+  ``person_id`` values directly (e.g. ``"ammi"``, ``"nangi"``) on its own
+  rows — not a second, locally-invented id space.
 - ``relay_facts`` / ``relay_fact_targets``: one row per noteworthy fact, one
   row per person it's tagged for — modeled directly on
   ``kanban_notify_subs``'s subscription-row shape (one row per interested
   party, not a JSON blob of targets).
+- ``relay_activities``: activities logged with no known target yet, for the
+  background scanner's cross-person matching.
 - Delivery is a separate background watcher (``gateway/relay_watchers.py``),
   not this module — this module only owns the data. The agent never gets a
   direct send-to-third-party tool; see ``toolsets.py``'s documented
@@ -42,22 +54,9 @@ from typing import NamedTuple, Optional
 from hermes_constants import get_hermes_home
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS known_people (
-    person_id     TEXT PRIMARY KEY,
-    display_name  TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS person_channels (
-    platform      TEXT NOT NULL,
-    chat_id       TEXT NOT NULL,
-    person_id     TEXT NOT NULL REFERENCES known_people(person_id),
-    PRIMARY KEY (platform, chat_id)
-);
-
 CREATE TABLE IF NOT EXISTS relay_facts (
     fact_id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_person_id  TEXT REFERENCES known_people(person_id),
+    source_person_id  TEXT,
     source_platform   TEXT NOT NULL,
     source_chat_id    TEXT NOT NULL,
     created_at        INTEGER NOT NULL,
@@ -66,7 +65,7 @@ CREATE TABLE IF NOT EXISTS relay_facts (
 
 CREATE TABLE IF NOT EXISTS relay_fact_targets (
     fact_id           INTEGER NOT NULL REFERENCES relay_facts(fact_id),
-    target_person_id  TEXT NOT NULL REFERENCES known_people(person_id),
+    target_person_id  TEXT NOT NULL,
     delivered_at      INTEGER,
     PRIMARY KEY (fact_id, target_person_id)
 );
@@ -83,9 +82,12 @@ CREATE INDEX IF NOT EXISTS idx_relay_fact_targets_pending
 -- person's activity. Deliberately NOT the calendar — see the spec's
 -- "same-person calendar-conflict reminders" section for why calendar
 -- integration is a separate, prompt-level concern, not this table.
+--
+-- person_id here is family-facts' own person_id (see module docstring) —
+-- no local FK, since there's no local people table to reference anymore.
 CREATE TABLE IF NOT EXISTS relay_activities (
     activity_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    person_id        TEXT NOT NULL REFERENCES known_people(person_id),
+    person_id        TEXT NOT NULL,
     platform         TEXT NOT NULL,
     chat_id          TEXT NOT NULL,
     description      TEXT NOT NULL,
@@ -115,6 +117,13 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
     is open, same rationale as ``kanban_db.py``'s ``_sqlite_connect``: an
     untracked ``open()``/``close()`` elsewhere could cancel this process's
     POSIX advisory locks on the database.
+
+    Drops the retired ``known_people``/``person_channels`` tables on every
+    connect (a no-op once already dropped) — cheap, and keeps an existing
+    live database tidy rather than leaving dead tables around indefinitely.
+    Safe unconditionally: this module never enabled FK enforcement
+    (``PRAGMA foreign_keys`` is never set), so nothing else in this schema
+    was ever actually constrained by their presence.
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
@@ -124,162 +133,125 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    conn.execute("DROP TABLE IF EXISTS person_channels")
+    conn.execute("DROP TABLE IF EXISTS known_people")
     return conn
 
 
-def register_person(conn: sqlite3.Connection, person_id: str, display_name: str) -> None:
-    """Register a person, or update their display name if already known.
-
-    ``person_id`` is a caller-chosen stable slug (e.g. "roshani"), not
-    auto-generated — the registry is small and human-curated, so a
-    predictable id is more useful than a surrogate one.
-    """
-    conn.execute(
-        """INSERT INTO known_people (person_id, display_name, created_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(person_id) DO UPDATE SET display_name = excluded.display_name""",
-        (person_id, display_name, int(time.time())),
-    )
-
-
-def link_channel(conn: sqlite3.Connection, platform: str, chat_id: str, person_id: str) -> None:
-    """Associate a (platform, chat_id) with a registered person.
-
-    A chat_id belongs to exactly one person (primary key on platform+chat_id);
-    a person may have channels on multiple platforms.
-    """
-    conn.execute(
-        """INSERT INTO person_channels (platform, chat_id, person_id)
-           VALUES (?, ?, ?)
-           ON CONFLICT(platform, chat_id) DO UPDATE SET person_id = excluded.person_id""",
-        (platform, chat_id, person_id),
-    )
-
-
-def resolve_person_by_name(conn: sqlite3.Connection, name: str) -> Optional[str]:
-    """Resolve a display name to a person_id, case-insensitively.
-
-    Exact match only, deliberately — no fuzzy matching. A wrong fuzzy match
-    here means relaying a private fact to the wrong person, which is a much
-    worse failure than the agent simply not finding a match (see the spec's
-    "unresolved-name handling" open question).
-
-    Falls back to family-facts (see sync_person_by_name_from_family_facts)
-    when not already known locally — see the person-registry-consolidation
-    spec: family-facts is the canonical registry, relay.db should not need a
-    second manual registration for someone it already knows.
-    """
-    row = conn.execute(
-        "SELECT person_id FROM known_people WHERE lower(display_name) = lower(?)",
-        (name,),
-    ).fetchone()
-    if row:
-        return row[0]
-    return sync_person_by_name_from_family_facts(conn, name)
+# ---------------------------------------------------------------------------
+# family-facts adapter — the sole identity source. Read-only, cross-file:
+# family-facts is a skill script (~/.hermes/skills/family/family-facts), not
+# part of the hermes-agent package, so it can't be imported directly — these
+# functions read its known schema (people/identifiers tables) via a
+# read-only connection instead. Every function here degrades to None/a
+# fallback rather than raising when family-facts is unreachable (e.g. its
+# db doesn't exist yet) — relay features simply treat that person as
+# unregistered, the same as before this module ever had its own tables.
+# ---------------------------------------------------------------------------
 
 
 def _family_facts_db_path() -> Optional[Path]:
-    """Resolve family-facts' family.db, mirroring its own db_path() logic.
-
-    family-facts is a skill script (~/.hermes/skills/family/family-facts),
-    not part of the hermes-agent package, so it can't be imported directly —
-    this reads its known schema (people/identifiers tables) via a read-only
-    connection instead.
-    """
+    """Resolve family-facts' family.db, mirroring its own db_path() logic."""
     explicit = os.environ.get("FAMILY_FACTS_DB")
     path = Path(explicit).expanduser() if explicit else get_hermes_home() / "family" / "family.db"
     return path if path.is_file() else None
 
 
-def _family_facts_display_name_for_chat_id(chat_id: str) -> Optional[str]:
-    """Resolve a chat_id's digits against family-facts' identifiers table."""
+def _family_facts_readonly_connect() -> Optional[sqlite3.Connection]:
+    db_path = _family_facts_db_path()
+    if not db_path:
+        return None
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def resolve_person_from_chat_id(chat_id: str) -> Optional[tuple[str, str]]:
+    """Resolve a WhatsApp chat_id to (person_id, display_name) via
+    family-facts — the sole identity store; relay.db keeps no cache of its
+    own, so every lookup reflects family-facts' current state immediately.
+    """
     digits = re.sub(r"\D", "", chat_id)
     if not digits:
         return None
-    db_path = _family_facts_db_path()
-    if not db_path:
+    conn = _family_facts_readonly_connect()
+    if not conn:
         return None
-    ff_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        row = ff_conn.execute(
-            "SELECT p.display_name FROM identifiers i "
+        row = conn.execute(
+            "SELECT p.person_id, p.display_name FROM identifiers i "
             "JOIN people p ON p.person_id = i.person_id WHERE i.identifier = ?",
             (digits,),
         ).fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
     finally:
-        ff_conn.close()
+        conn.close()
 
 
-def sync_person_from_family_facts(
-    conn: sqlite3.Connection, platform: str, chat_id: str
-) -> Optional[str]:
-    """Auto-register a person in relay.db from family-facts' canonical
-    registry, keyed off a chat_id already seen live — avoids a second,
-    manual registration step for anyone family-facts already knows (see the
-    person-registry-consolidation spec: this was previously a fully manual,
-    easy-to-forget step — Senara had to be found and registered by hand
-    2026-08-26 despite family-facts already knowing her).
+def resolve_person_by_name(name: str) -> Optional[str]:
+    """Resolve a display name to family-facts' person_id, case-insensitively.
 
-    relay.db's own person_id stays a lowercased-display-name slug (not
-    family-facts' own person_id, which uses kinship-term slugs like "ammi")
-    to avoid migrating existing relay_activities/relay_facts rows, which
-    already use this convention.
-
-    Returns the resolved person_id, or None if family-facts doesn't know
-    this chat_id either (a genuinely new contact — needs a manual
-    `person add` in family-facts first, not something relay.db can invent).
+    Exact match only, deliberately — no fuzzy matching. A wrong fuzzy match
+    here means relaying a private fact to the wrong person, which is a much
+    worse failure than the agent simply not finding a match (see the spec's
+    "unresolved-name handling" open question).
     """
-    display_name = _family_facts_display_name_for_chat_id(chat_id)
-    if not display_name:
+    conn = _family_facts_readonly_connect()
+    if not conn:
         return None
-    person_id = display_name.strip().lower()
-    register_person(conn, person_id, display_name)
-    link_channel(conn, platform, chat_id, person_id)
-    return person_id
-
-
-def sync_person_by_name_from_family_facts(conn: sqlite3.Connection, name: str) -> Optional[str]:
-    """Fallback for resolve_person_by_name: check family-facts by display
-    name and auto-register into relay.db (including a best-effort WhatsApp
-    identifier) if found there but not yet locally known.
-
-    Identifier reconstruction is best-effort: every WhatsApp identifier this
-    family currently has on file is @lid-suffixed (confirmed 2026-08-26,
-    see the person-registry-consolidation spec) — fine for a single-family
-    install, not a general rule for other WhatsApp id formats.
-    """
-    db_path = _family_facts_db_path()
-    if not db_path:
-        return None
-    ff_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        row = ff_conn.execute(
-            "SELECT p.display_name, "
-            "(SELECT identifier FROM identifiers WHERE person_id = p.person_id "
-            " AND kind = 'whatsapp' ORDER BY length(identifier) DESC LIMIT 1) "
-            "FROM people p WHERE lower(p.display_name) = lower(?)",
+        row = conn.execute(
+            "SELECT person_id FROM people WHERE lower(display_name) = lower(?)",
             (name,),
         ).fetchone()
+        return row[0] if row else None
     finally:
-        ff_conn.close()
-    if not row:
+        conn.close()
+
+
+def display_name_for_person(person_id: str) -> str:
+    """Best-effort display name for a family-facts person_id.
+
+    Falls back to the raw id if family-facts is unreachable or doesn't know
+    it — callers always get a printable string back rather than handling
+    None, matching the old known_people-backed behaviour's fallback shape.
+    """
+    conn = _family_facts_readonly_connect()
+    if not conn:
+        return person_id
+    try:
+        row = conn.execute(
+            "SELECT display_name FROM people WHERE person_id = ?", (person_id,)
+        ).fetchone()
+        return row[0] if row else person_id
+    finally:
+        conn.close()
+
+
+def resolve_chat_id_for_person(person_id: str, *, platform: str = "whatsapp") -> Optional[str]:
+    """Resolve family-facts' person_id back to a deliverable chat_id.
+
+    Prefers the longest identifier on file for that person+kind: every
+    WhatsApp identifier this family currently has is the longer @lid-style
+    numeric id, not the older, shorter phone number (confirmed 2026-08-26,
+    see the person-registry-consolidation spec) — a pragmatic heuristic for
+    a single-family install, not a general rule for other id formats.
+    """
+    conn = _family_facts_readonly_connect()
+    if not conn:
         return None
-    display_name, best_identifier = row
-    person_id = display_name.strip().lower()
-    register_person(conn, person_id, display_name)
-    if best_identifier:
-        link_channel(conn, "whatsapp", f"{best_identifier}@lid", person_id)
-    return person_id
+    try:
+        row = conn.execute(
+            "SELECT identifier FROM identifiers WHERE person_id = ? AND kind = ? "
+            "ORDER BY length(identifier) DESC LIMIT 1",
+            (person_id, platform),
+        ).fetchone()
+        return f"{row[0]}@lid" if row else None
+    finally:
+        conn.close()
 
 
-def resolve_channel(conn: sqlite3.Connection, person_id: str, platform: str) -> Optional[str]:
-    """Return the chat_id for a person on a given platform, if known."""
-    row = conn.execute(
-        "SELECT chat_id FROM person_channels WHERE person_id = ? AND platform = ?",
-        (person_id, platform),
-    ).fetchone()
-    return row[0] if row else None
+# ---------------------------------------------------------------------------
+# relay_facts / relay_fact_targets
+# ---------------------------------------------------------------------------
 
 
 def record_relay_fact(
@@ -355,6 +327,11 @@ def mark_delivered(conn: sqlite3.Connection, fact_id: int, target_person_id: str
     )
 
 
+# ---------------------------------------------------------------------------
+# relay_activities
+# ---------------------------------------------------------------------------
+
+
 def log_activity(
     conn: sqlite3.Connection,
     *,
@@ -367,7 +344,11 @@ def log_activity(
     """Log an activity with no known target yet — the scanner watcher
     (gateway/relay_watchers.py) matches it against other people's activities
     later. Distinct from record_relay_fact, which is for the rare case the
-    agent already knows who to tell."""
+    agent already knows who to tell.
+
+    ``person_id`` must already be resolved (via resolve_person_from_chat_id)
+    by the caller — this function does not do identity resolution itself.
+    """
     cursor = conn.execute(
         """INSERT INTO relay_activities
            (person_id, platform, chat_id, description, occurred_at)
