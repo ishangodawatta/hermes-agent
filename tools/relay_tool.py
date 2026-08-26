@@ -11,15 +11,19 @@ later, but delivery and cross-person matching both happen out-of-band via
 existing "agent can't self-send to a third party" design constraint
 (``toolsets.py``'s documented agents-do-not-get-send-message rule).
 
-Two tools, for two different situations:
+One agent-callable tool:
 - ``relay_note``: the agent already knows who should hear about something
   right now (rare — needs cross-person context the agent usually doesn't
   have).
-- ``log_activity``: the common case — something worth remembering (an
-  errand, a plan) with no one obvious to tell yet. The background scanner
-  (``_relay_scanner_watcher``) compares it against other people's logged
-  activities later and creates a relay_note-equivalent fact automatically if
-  it finds a same-day match.
+
+The common case — an ordinary errand or plan with no one obvious to tell yet
+— is no longer an agent tool. It's handled by a silent, always-run background
+classifier (``gateway/notice_classifier.py``) that runs on every inbound
+message independently of the conversational agent, because relying on the
+live model to remember to call a tool for this proved unreliable in practice
+(confirmed via live instrumentation 2026-08-26 — the instruction reached the
+model, the tool was available, and it still wasn't called). See the
+``hermes-agent-alfred-manager-architecture`` spec.
 """
 
 from __future__ import annotations
@@ -138,83 +142,6 @@ def relay_note(
     return " ".join(parts)
 
 
-LOG_ACTIVITY_SCHEMA = {
-    "name": "log_activity",
-    "description": (
-        "Log something worth remembering in case it turns out to matter later — an "
-        "errand, a plan, something the person is about to do — even with no one "
-        "specific to tell right now. A background check compares this against other "
-        "registered family members' logged activities later that day and relays "
-        "automatically if a real coincidence turns up (e.g. someone else independently "
-        "mentions the same errand). Use this instead of relay_note whenever you don't "
-        "already know a specific person who needs telling — that's the common case.\n\n"
-        "If the activity means the person will be away from home, also consider "
-        "checking the family calendar (the google-workspace skill's calendar script) "
-        "for anything in the next couple of hours they'd need to be back for, and "
-        "mention it naturally in your reply if relevant — a human secretary would say "
-        "so in the same breath, not as a separate message."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "description": {
-                "type": "string",
-                "description": (
-                    "A short, third-person description of the activity, e.g. "
-                    "'Ishan is heading to Tesco'. Not raw message text."
-                ),
-            },
-        },
-        "required": ["description"],
-    },
-}
-
-
-def log_activity(
-    args: dict[str, Any],
-    *,
-    session_id: Optional[str] = None,
-    **_kw: Any,
-) -> str:
-    description = (args.get("description") or "").strip()
-    if not description:
-        return "Error: description is required."
-    if not session_id:
-        return "Error: no session context available; cannot determine the source chat."
-
-    from hermes_state import SessionDB
-
-    session_db = SessionDB(read_only=True)
-    session = session_db.get_session(session_id)
-    if not session:
-        return "Error: could not resolve the current session's chat."
-    platform = session.get("source") or ""
-    chat_id = session.get("chat_id") or ""
-    if not platform or not chat_id:
-        return "Error: current session has no platform/chat_id — cannot log from here."
-
-    conn = relay_db.connect()
-    try:
-        row = conn.execute(
-            "SELECT person_id FROM person_channels WHERE platform = ? AND chat_id = ?",
-            (platform, chat_id),
-        ).fetchone()
-        if not row:
-            return "Not logged: this chat isn't linked to a registered person."
-        person_id = row[0]
-        activity_id = relay_db.log_activity(
-            conn,
-            person_id=person_id,
-            platform=platform,
-            chat_id=chat_id,
-            description=description,
-        )
-    finally:
-        conn.close()
-
-    return f"Logged (activity #{activity_id}). No action needed now."
-
-
 from tools.registry import registry  # noqa: E402
 
 registry.register(
@@ -223,12 +150,4 @@ registry.register(
     schema=RELAY_NOTE_SCHEMA,
     handler=lambda args, **kw: relay_note(args, session_id=kw.get("session_id")),
     emoji="📨",
-)
-
-registry.register(
-    name="log_activity",
-    toolset="relay",
-    schema=LOG_ACTIVITY_SCHEMA,
-    handler=lambda args, **kw: log_activity(args, session_id=kw.get("session_id")),
-    emoji="📝",
 )

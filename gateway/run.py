@@ -5387,6 +5387,32 @@ class TurnRunner:
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
+        # LOCAL-ONLY: silent per-message notice/classifier pass (see
+        # gateway/notice_classifier.py and the alfred-manager-architecture
+        # spec). Fire-and-forget on the gateway loop — never blocks or
+        # delays this turn's reply, and never talks to the user itself.
+        if (
+            ctx.source.platform == Platform.WHATSAPP
+            and isinstance(ctx.message, str)
+            and ctx.message.strip()
+        ):
+            try:
+                from gateway.notice_classifier import run_notice_classifier_tick
+
+                safe_schedule_threadsafe(
+                    asyncio.to_thread(
+                        run_notice_classifier_tick,
+                        platform=ctx.source.platform.value,
+                        chat_id=ctx.source.chat_id or "",
+                        message_text=ctx.message,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="notice classifier scheduling error",
+                )
+            except Exception:
+                logger.debug("notice classifier: dispatch failed", exc_info=True)
+
         max_iterations = _current_max_iterations()
 
         try:
