@@ -2667,6 +2667,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.relay_watchers import GatewayRelayWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -3807,6 +3808,9 @@ def _get_channel_override(
 
     Looks up ``channel_overrides`` by ``chat_id``, then ``thread_id``, then
     ``parent_id`` (forum threads / child channels inherit the parent entry).
+    Falls back to a ``"default"`` entry, if configured, when none of those
+    match — lets a platform-wide override apply to every channel without
+    enumerating each chat_id individually.
     """
     platforms = getattr(config, "platforms", None)
     if not platforms:
@@ -3821,7 +3825,7 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
-    return None
+    return overrides.get("default")
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -6733,7 +6737,7 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayRelayWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -13366,6 +13370,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # subscriptions owned by the profiles whose adapters it hosts, even
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+
+        # Start background cross-chat relay notifier + scanner (local-only
+        # feature, see gateway/relay_watchers.py — not upstream).
+        self._spawn_supervised(self._relay_notifier_watcher, "relay_notifier_watcher")
+        self._spawn_supervised(self._relay_scanner_watcher, "relay_scanner_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
