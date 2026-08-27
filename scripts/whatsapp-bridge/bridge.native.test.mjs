@@ -16,6 +16,7 @@ import {
   buildPollPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createQuotedMediaCache,
   appendMediaFailureNote,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -129,6 +130,131 @@ import {
   console.log('  ✓ inbound quoted metadata includes quoted text');
 }
 
+// -- reply to uncaptioned quoted media resolves the cached original file --
+{
+  // contextInfo.quotedMessage only ever carries a thumbnail-sized stub for
+  // media (or nothing for an uncaptioned attachment) — extractBridgeEvent
+  // must fall back to lookupQuotedMedia to find the original cached file.
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-2',
+        remoteJid: '15551234567@s.whatsapp.net',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      pushName: 'Tester',
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: 'did you save this?',
+          contextInfo: {
+            stanzaId: 'original-image-1',
+            participant: '15550001111@s.whatsapp.net',
+            remoteJid: '15551234567@s.whatsapp.net',
+            // Real WhatsApp traffic: an uncaptioned quoted image carries no
+            // usable text, just a thumbnail-only imageMessage stub.
+            quotedMessage: { imageMessage: {} },
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: [],
+    downloadMedia: async () => Buffer.from(''),
+    lookupQuotedMedia: (chatId, messageId) => {
+      assert.equal(chatId, '15551234567@s.whatsapp.net');
+      assert.equal(messageId, 'original-image-1');
+      return { hasMedia: true, mediaType: 'image', mediaUrls: ['/cache/image/img_original.jpg'] };
+    },
+  });
+
+  assert.deepEqual(event.quotedMediaUrls, ['/cache/image/img_original.jpg']);
+  assert.equal(event.quotedMediaType, 'image');
+  assert.equal(event.quotedText, 'sent an image');
+  console.log('  ✓ reply to uncaptioned quoted image resolves cached original file');
+}
+
+// -- bare quote-reply (no own text/media) still resolves quoted media -----
+{
+  // A reply with no caption of its own (e.g. a bare quote of an uncaptioned
+  // image) has empty own body/media, so bridge.js's empty-message guard must
+  // consult quotedMediaUrls rather than only event.body/event.hasMedia, or
+  // the reply is dropped even though extractBridgeEvent resolved real content.
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-4',
+        remoteJid: '15551234567@s.whatsapp.net',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      pushName: 'Tester',
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: '',
+          contextInfo: {
+            stanzaId: 'original-image-2',
+            participant: '15550001111@s.whatsapp.net',
+            remoteJid: '15551234567@s.whatsapp.net',
+            quotedMessage: { imageMessage: {} },
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: [],
+    downloadMedia: async () => Buffer.from(''),
+    lookupQuotedMedia: () => ({ hasMedia: true, mediaType: 'image', mediaUrls: ['/cache/image/img_original.jpg'] }),
+  });
+
+  assert.equal(event.body, '');
+  assert.equal(event.hasMedia, false);
+  assert.deepEqual(event.quotedMediaUrls, ['/cache/image/img_original.jpg']);
+  console.log('  ✓ bare quote-reply with no own content still carries resolved quoted media');
+}
+
+// -- quoted media lookup miss leaves quoted fields empty (no crash) -------
+{
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-3',
+        remoteJid: '15551234567@s.whatsapp.net',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: 'thanks',
+          contextInfo: {
+            stanzaId: 'long-gone-message',
+            participant: '15550001111@s.whatsapp.net',
+            remoteJid: '15551234567@s.whatsapp.net',
+            quotedMessage: { imageMessage: {} },
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: [],
+    downloadMedia: async () => Buffer.from(''),
+    lookupQuotedMedia: () => null,
+  });
+
+  assert.deepEqual(event.quotedMediaUrls, []);
+  assert.equal(event.quotedMediaType, '');
+  console.log('  ✓ quoted media cache miss leaves quoted media fields empty');
+}
+
 {
   const event = await extractBridgeEvent({
     msg: {
@@ -156,6 +282,49 @@ import {
   assert.equal(event.nativeType, 'documentMessage');
   assert.deepEqual(event.mediaUrls, ['/tmp/report.pdf']);
   console.log('  ✓ inbound document metadata preserves MIME and filename');
+}
+
+// -- device-suffixed JID normalization (swipe-reply / mention regression) --
+{
+  // Baileys can report a device-suffixed JID (e.g. "...:46@...") for the
+  // quoting participant while the bot's own id from sock.user is normalized
+  // the same way elsewhere. Both must collapse to the same bare-id form so
+  // reply-to-bot / mention matching in gateway/platforms/whatsapp_common.py
+  // actually fires.
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-2',
+        remoteJid: '15551234567@s.whatsapp.net',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: 'replying to the bot',
+          contextInfo: {
+            stanzaId: 'outbound-2',
+            participant: '15559998888:46@s.whatsapp.net',
+            remoteJid: '15551234567@s.whatsapp.net',
+            quotedMessage: { conversation: 'a message from the bot' },
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: ['15559998888@s.whatsapp.net'],
+    downloadMedia: async () => Buffer.from(''),
+  });
+
+  assert.equal(
+    event.quotedParticipant,
+    '15559998888@s.whatsapp.net',
+    'device-suffixed quotedParticipant must normalize to the same bare id as botIds',
+  );
+  console.log('  ✓ device-suffixed quotedParticipant normalizes to match bare botIds');
 }
 
 {
@@ -409,6 +578,27 @@ import {
   assert.equal(event.body, 'see attached\n[document could not be downloaded]');
   assert.equal(event.mediaUrls.length, 0);
   console.log('  ✓ captioned failed download keeps caption and appends note');
+}
+
+// -- createQuotedMediaCache ------------------------------------------------
+{
+  const cache = createQuotedMediaCache(2);
+  cache.remember('chat-a', 'msg-1', { hasMedia: true, mediaType: 'image', mediaUrls: ['/cache/img1.jpg'] });
+
+  assert.deepEqual(cache.get('chat-a', 'msg-1'), { hasMedia: true, mediaType: 'image', mediaUrls: ['/cache/img1.jpg'] });
+  // Different chatId, same messageId — must not collide; message ids are
+  // only unique within their own chat/JID.
+  assert.equal(cache.get('chat-b', 'msg-1'), null);
+  assert.equal(cache.get('chat-a', 'unknown-msg'), null);
+
+  cache.remember('chat-a', 'msg-2', { hasMedia: false });
+  cache.remember('chat-a', 'msg-3', { hasMedia: false });
+  // Capacity is 2: the oldest entry (msg-1) must have been evicted.
+  assert.equal(cache.get('chat-a', 'msg-1'), null);
+  assert.notEqual(cache.get('chat-a', 'msg-2'), null);
+  assert.notEqual(cache.get('chat-a', 'msg-3'), null);
+
+  console.log('  ✓ createQuotedMediaCache resolves by chatId+messageId and evicts oldest past capacity');
 }
 
 console.log('\n✅ All WhatsApp native bridge helper tests passed.');
