@@ -291,6 +291,41 @@ def record_relay_fact(
     return fact_id
 
 
+class RecentFact(NamedTuple):
+    fact_id: int
+    summary: str
+    created_at: int
+
+
+def most_recent_fact_between(
+    conn: sqlite3.Connection, person_a: str, person_b: str, *, since: int
+) -> Optional[RecentFact]:
+    """Most recent relay_fact already exchanged between this pair of people
+    (either direction — a fact sourced from A targeting B, or from B
+    targeting A), within the given window.
+
+    Feeds the scanner's duplicate-relay dedup check (see the
+    cross-chat-relay spec's "Duplicate-relay dedup" section): before
+    relaying a new match, check whether this pair was already told about
+    something recently, and if so, judge whether the new match is the same
+    underlying topic (suppress) or genuinely different (relay as normal).
+    """
+    row = conn.execute(
+        """SELECT f.fact_id, f.summary, f.created_at
+           FROM relay_facts f
+           JOIN relay_fact_targets t ON t.fact_id = f.fact_id
+           WHERE f.created_at >= ?
+             AND (
+               (f.source_person_id = ? AND t.target_person_id = ?)
+               OR (f.source_person_id = ? AND t.target_person_id = ?)
+             )
+           ORDER BY f.created_at DESC
+           LIMIT 1""",
+        (since, person_a, person_b, person_b, person_a),
+    ).fetchone()
+    return RecentFact(*row) if row else None
+
+
 class PendingRelay(NamedTuple):
     fact_id: int
     target_person_id: str

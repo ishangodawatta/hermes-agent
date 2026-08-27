@@ -164,6 +164,39 @@ If there is no real match, respond {{"match": false, "candidate_index": null, \
 "summary_for_{pivot_name}": "", "summary_for_other": ""}}."""
 
 
+_DEDUP_PROMPT_TEMPLATE = """You are checking whether a new family coincidence match is substantially the \
+same topic as one already relayed to the same two people recently, to avoid telling them the same thing \
+twice.
+
+Already relayed, {prior_when}:
+"{prior_summary}"
+
+New match about to be relayed:
+"{new_summary}"
+
+Is the new match about the SAME underlying topic or event as the one already relayed (telling them again \
+would be redundant), or a genuinely DIFFERENT topic or coincidence between the same two people (it should \
+still be sent)? A shared topic phrased differently is still the same topic — judge substance, not wording.
+
+Respond with ONLY a JSON object, no other text:
+{{"same_topic": true/false}}"""
+
+
+def _get_dedup_window_seconds(cfg: Dict[str, Any]) -> int:
+    """Hours a prior relay between the same pair counts as "recent" for
+    duplicate-topic suppression. Config: relay.dedup_window_hours (default
+    4) — see the cross-chat-relay spec's "Duplicate-relay dedup" section for
+    why 4h and why this stays a knob rather than a hardcoded constant (no
+    empirical tuning yet).
+    """
+    relay_cfg = cfg.get("relay", {}) if isinstance(cfg.get("relay"), dict) else {}
+    hours = relay_cfg.get("dedup_window_hours", 4)
+    try:
+        return max(0, int(hours)) * 3600
+    except (TypeError, ValueError):
+        return 4 * 3600
+
+
 def _format_when(occurred_at: int, now: int) -> str:
     delta = max(0, now - occurred_at)
     if delta < 300:
@@ -333,6 +366,60 @@ class GatewayRelayWatchersMixin:
                 )
                 await asyncio.to_thread(self._relay_mark_compared_sync, pivot.activity_id, None)
                 continue
+
+            def _find_recent_fact(pivot=pivot, matched=matched):
+                conn = relay_db.connect()
+                try:
+                    from hermes_cli.config import load_config_readonly
+
+                    window = _get_dedup_window_seconds(load_config_readonly())
+                    return relay_db.most_recent_fact_between(
+                        conn, pivot.person_id, matched.person_id, since=now - window
+                    )
+                finally:
+                    conn.close()
+
+            recent_fact = await asyncio.to_thread(_find_recent_fact)
+            if recent_fact is not None:
+                dedup_prompt = _DEDUP_PROMPT_TEMPLATE.format(
+                    prior_when=_format_when(recent_fact.created_at, now),
+                    prior_summary=recent_fact.summary,
+                    new_summary=summary_for_pivot,
+                )
+                dedup_review = await asyncio.to_thread(_run_relay_llm_review, dedup_prompt)
+                dedup_parsed = (
+                    None
+                    if dedup_review.get("error")
+                    else self._relay_parse_judgment(dedup_review.get("final") or "")
+                )
+                if dedup_parsed is not None and dedup_parsed.get("same_topic"):
+                    # Same topic already relayed recently -- suppress a
+                    # redundant second relay, but still mark both activities
+                    # against the EXISTING fact so neither is retried forever.
+                    def _suppress_duplicate(
+                        pivot=pivot, matched=matched, fact_id=recent_fact.fact_id,
+                    ):
+                        conn = relay_db.connect()
+                        try:
+                            relay_db.mark_activity_compared(
+                                conn, pivot.activity_id, matched_fact_id=fact_id
+                            )
+                            relay_db.mark_activity_matched(conn, matched.activity_id, fact_id)
+                        finally:
+                            conn.close()
+
+                    await asyncio.to_thread(_suppress_duplicate)
+                    logger.debug(
+                        "relay scanner: suppressed duplicate relay for activity #%s (%s) "
+                        "with #%s (%s) -- same topic as fact #%s",
+                        pivot.activity_id, pivot_name, matched.activity_id,
+                        matched.person_id, recent_fact.fact_id,
+                    )
+                    continue
+                # On judgment failure/error, or a genuinely different topic,
+                # fall through and relay as normal -- an occasional duplicate
+                # is a much smaller cost than silently losing a distinct,
+                # real coincidence to an uncertain dedup call.
 
             def _write_match(
                 pivot=pivot, matched=matched,
