@@ -291,11 +291,17 @@ def run_notice_classifier_tick(*, platform: str, chat_id: str, message_text: str
     if parsed.get("is_item_request"):
         item = str(parsed.get("item") or "").strip()
         if item:
-            _todoist_add(item, labels=["shopping", label])
+            # "shopping" is a topic label (subject matter), not a type --
+            # every agent_tasks item needs a real type too, or the
+            # taxonomy-conformance checker flags it (see
+            # hermes-agent-task-followthrough-consolidation spec).
+            _todoist_add(item, labels=["shopping", "task", label])
             logger.debug("notice classifier: logged shopping item %r for %s", item, person_name)
 
     if parsed.get("is_commitment"):
         description = str(parsed.get("commitment_description") or "").strip()
         if description:
-            _todoist_add(description, labels=[label])
+            # "task" type: it's the speaker's own commitment to do
+            # something, not a chase-someone-else waiting-reply.
+            _todoist_add(description, labels=["task", label])
             logger.debug("notice classifier: logged commitment for %s", person_name)

@@ -161,7 +161,7 @@ class TestRunNoticeClassifierTick:
         notice_classifier.run_notice_classifier_tick(
             platform="whatsapp", chat_id=_KNOWN_CHAT_ID, message_text="can someone grab toothpaste",
         )
-        assert todoist_calls == [("toothpaste", ["shopping", "ishan"])]
+        assert todoist_calls == [("toothpaste", ["shopping", "task", "ishan"])]
 
     def test_commitment_signal_calls_todoist_with_person_label_only(self, relay_conn, known_person, monkeypatch):
         monkeypatch.setattr(
@@ -177,7 +177,7 @@ class TestRunNoticeClassifierTick:
         notice_classifier.run_notice_classifier_tick(
             platform="whatsapp", chat_id=_KNOWN_CHAT_ID, message_text="I'll call the dentist tomorrow",
         )
-        assert todoist_calls == [("Ishan will call the dentist tomorrow", ["ishan"])]
+        assert todoist_calls == [("Ishan will call the dentist tomorrow", ["task", "ishan"])]
 
     def test_multiple_signals_all_route(self, relay_conn, known_person, monkeypatch):
         monkeypatch.setattr(
@@ -200,7 +200,7 @@ class TestRunNoticeClassifierTick:
         finally:
             conn.close()
         assert len(activities) == 1
-        assert todoist_calls == [("bread", ["shopping", "ishan"])]
+        assert todoist_calls == [("bread", ["shopping", "task", "ishan"])]
 
     def test_no_signals_writes_nothing(self, relay_conn, known_person, monkeypatch):
         monkeypatch.setattr(
