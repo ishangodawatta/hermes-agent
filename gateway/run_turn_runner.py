@@ -1200,6 +1200,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             apply_launch_yolo(ctx.session_key)
         platform_key = policy.platform if policy else ("cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value)
         combined_ephemeral = self._combined_ephemeral_prompt()
+        # LOCAL-ONLY: silent per-message notice/classifier pass (gateway/notice_classifier.py, see the
+        # alfred-manager-architecture spec). Runs on its own daemon thread so it never blocks or delays
+        # this turn's reply, and it never talks to the user itself. Not upstream.
+        if ctx.source.platform == Platform.WHATSAPP and isinstance(ctx.message, str) and ctx.message.strip():
+            try:
+                import threading
+                from gateway.notice_classifier import run_notice_classifier_tick
+                threading.Thread(
+                    target=run_notice_classifier_tick,
+                    kwargs={"platform": ctx.source.platform.value, "chat_id": ctx.source.chat_id or "",
+                            "message_text": ctx.message},
+                    name="notice-classifier", daemon=True,
+                ).start()
+            except Exception:
+                logger.debug("notice classifier: dispatch failed", exc_info=True)
         if policy and policy.skills_prompt:
             combined_ephemeral = "\n\n".join(p for p in (combined_ephemeral, policy.skills_prompt) if p)
         max_iterations = policy.max_turns if policy else _current_max_iterations()

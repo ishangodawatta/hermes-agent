@@ -2189,6 +2189,7 @@ from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.session_state import SessionState, legacy_dict_property, legacy_lease_token_property
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.relay_watchers import GatewayRelayWatchersMixin  # LOCAL-ONLY cross-chat relay, not upstream
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
@@ -2919,7 +2920,8 @@ def _channel_override_lookup_keys(
 def _get_channel_override(
     config: GatewayConfig, platform: Platform, chat_id: str, *, thread_id: Optional[str] = None,
     parent_id: Optional[str] = None) -> Optional[ChannelOverride]:
-    """Per-channel override via chat_id, then thread_id, then parent_id; None if absent."""
+    """Per-channel override via chat_id, then thread_id, then parent_id; falls back to a
+    ``"default"`` entry if configured, else None."""
     platforms = getattr(config, "platforms", None)
     if not platforms:
         return None
@@ -2931,7 +2933,7 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
-    return None
+    return overrides.get("default")
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -3339,7 +3341,7 @@ from gateway.run_runtime_init import GatewayRuntimeInitMixin
 
 
 class GatewayRunner(
-    GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
+    GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayRelayWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,

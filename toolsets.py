@@ -127,6 +127,10 @@ TOOLSETS = {
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    # LOCAL-ONLY, not upstream (see hermes_cli/relay_db.py). Deliberately not in _HERMES_CORE_TOOLS;
+    # enable per platform via platform_toolsets in config.yaml. Activity logging for same-day
+    # cross-person matching is a separate always-on background classifier (gateway/notice_classifier.py).
+    "relay": _ts("Cross-chat relay: queue a fact for background delivery to a known target (local-only feature)", ["relay_note"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
