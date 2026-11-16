@@ -2894,7 +2894,8 @@ def _channel_override_lookup_keys(
 def _get_channel_override(
     config: GatewayConfig, platform: Platform, chat_id: str, *, thread_id: Optional[str] = None,
     parent_id: Optional[str] = None) -> Optional[ChannelOverride]:
-    """Per-channel override via chat_id, then thread_id, then parent_id; None if absent."""
+    """Per-channel override via chat_id, then thread_id, then parent_id; falls back to a
+    ``"default"`` entry if configured, else None."""
     platforms = getattr(config, "platforms", None)
     if not platforms:
         return None
@@ -2906,7 +2907,7 @@ def _get_channel_override(
         ov = overrides.get(key)
         if ov is not None:
             return ov
-    return None
+    return overrides.get("default")
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
